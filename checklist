@@ -1,0 +1,591 @@
+import { useState, useEffect, useCallback } from "react";
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type Category = "structure" | "power" | "camera" | "software" | "safety";
+type SaveStatus = "idle" | "saving" | "saved" | "error";
+type TabId = "checklist" | "calc" | "gear" | "log";
+
+interface Task {
+  id: number;
+  text: string;
+  completed: boolean;
+  critical: boolean;
+  category: string;
+}
+
+interface Equipment {
+  camera: string;
+  lens: string;
+  fps: number;
+  duration: number;
+}
+
+interface LogEntry {
+  time: string;
+  action: string;
+  text: string;
+}
+
+interface SavedState {
+  tasks?: Task[];
+  equipment?: Equipment;
+  note?: string;
+  sessionLog?: LogEntry[];
+  savedAt?: string;
+}
+
+interface Preset {
+  name: string;
+  fps: number;
+  duration: number;
+  desc: string;
+}
+
+interface CategoryMeta {
+  key: Category;
+  label: string;
+  color: string;
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const STORAGE_KEY = "bolt_v9_state";
+
+// ใช้ Array แทน Object เพื่อหลีกเลี่ยง Object.entries (ไม่ต้องการ ES2017)
+const CATEGORIES: CategoryMeta[] = [
+  { key: "structure", label: "Structure", color: "#a78bfa" },
+  { key: "power",     label: "Power",     color: "#fb923c" },
+  { key: "camera",    label: "Camera",    color: "#38bdf8" },
+  { key: "software",  label: "Software",  color: "#34d399" },
+  { key: "safety",    label: "Safety",    color: "#f87171" },
+];
+
+function getCategoryMeta(key: string): CategoryMeta {
+  return CATEGORIES.find(function(c) { return c.key === key; }) || CATEGORIES[0];
+}
+
+const DEFAULT_TASKS: Task[] = [
+  { id: 1,  text: "พื้นรับน้ำหนักได้ (Pedestal 530kg / Track 730kg)", completed: false, critical: true,  category: "structure" },
+  { id: 2,  text: "ระบบไฟ 3-Phase (400–480V) — No Neutral",           completed: false, critical: true,  category: "power"     },
+  { id: 3,  text: "ยึดฐาน Base Plate / Weights (400kg ต่อมุม)",        completed: false, critical: true,  category: "structure" },
+  { id: 4,  text: "Mount กล้อง/เลนส์ และ Lock น็อตทุกจุด",            completed: false, critical: true,  category: "camera"    },
+  { id: 5,  text: "ตั้งค่า Software Limits ใน Flair",                  completed: false, critical: true,  category: "software"  },
+  { id: 6,  text: "E-Stop ทุกจุด พร้อมใช้งาน",                        completed: false, critical: true,  category: "safety"    },
+  { id: 7,  text: "ประกาศ \"Rig Moving\" และทำ Slow Test Run",          completed: false, critical: true,  category: "safety"    },
+  { id: 8,  text: "ตรวจสอบ Cable Management — ไม่มีการพันกัน",        completed: false, critical: false, category: "structure" },
+  { id: 9,  text: "White Balance และ Exposure ตั้งค่าแล้ว",            completed: false, critical: false, category: "camera"    },
+  { id: 10, text: "ทดสอบ Move Path ด้วย Ghost Run",                   completed: false, critical: false, category: "software"  },
+];
+
+const MOVE_PRESETS: Preset[] = [
+  { name: "Orbit",     fps: 24,  duration: 8,  desc: "วนรอบ Object"  },
+  { name: "Arm Sweep", fps: 48,  duration: 4,  desc: "Sweep ยาว"     },
+  { name: "Burst",     fps: 120, duration: 1,  desc: "Hyper Slow-mo" },
+  { name: "Ramp Up",   fps: 24,  duration: 12, desc: "เร่งความเร็ว"  },
+];
+
+const TABS: Array<{ id: TabId; label: string }> = [
+  { id: "checklist", label: "Checklist" },
+  { id: "calc",      label: "Frames"    },
+  { id: "gear",      label: "Gear"      },
+  { id: "log",       label: "Log"       },
+];
+
+// ─── Storage helpers ──────────────────────────────────────────────────────────
+
+function storageGet(key: string): SavedState | null {
+  try {
+    var raw = localStorage.getItem(key);
+    return raw ? (JSON.parse(raw) as SavedState) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function storageSet(key: string, value: SavedState): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (e) {
+    // quota exceeded
+  }
+}
+
+function storageDelete(key: string): void {
+  try {
+    localStorage.removeItem(key);
+  } catch (e) {
+    // ignore
+  }
+}
+
+// ─── Component ────────────────────────────────────────────────────────────────
+
+export default function App() {
+  var [tab, setTab]               = useState<TabId>("checklist");
+  var [tasks, setTasks]           = useState<Task[]>(DEFAULT_TASKS);
+  var [equipment, setEquipment]   = useState<Equipment>({ camera: "", lens: "", fps: 24, duration: 4.0 });
+  var [note, setNote]             = useState<string>("");
+  var [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
+  var [loading, setLoading]       = useState<boolean>(true);
+  var [newTask, setNewTask]       = useState<string>("");
+  var [addingTask, setAddingTask] = useState<boolean>(false);
+  var [showReset, setShowReset]   = useState<boolean>(false);
+  var [sessionLog, setSessionLog] = useState<LogEntry[]>([]);
+
+  useEffect(function() { loadData(); }, []);
+
+  function loadData(): void {
+    setLoading(true);
+    var saved = storageGet(STORAGE_KEY);
+    if (saved) {
+      if (saved.tasks)              setTasks(saved.tasks);
+      if (saved.equipment)          setEquipment(saved.equipment);
+      if (saved.note !== undefined) setNote(saved.note);
+      if (saved.sessionLog)         setSessionLog(saved.sessionLog);
+    }
+    setLoading(false);
+  }
+
+  var saveData = useCallback(function(
+    tasksData: Task[],
+    equipData: Equipment,
+    noteData: string,
+    logData: LogEntry[]
+  ): void {
+    setSaveStatus("saving");
+    try {
+      storageSet(STORAGE_KEY, {
+        tasks: tasksData,
+        equipment: equipData,
+        note: noteData,
+        sessionLog: logData,
+        savedAt: new Date().toISOString(),
+      });
+      setSaveStatus("saved");
+      setTimeout(function() { setSaveStatus("idle"); }, 2000);
+    } catch (e) {
+      setSaveStatus("error");
+    }
+  }, []);
+
+  function updateTasks(newTasks: Task[]): void {
+    setTasks(newTasks);
+    saveData(newTasks, equipment, note, sessionLog);
+  }
+
+  function updateEquipment(newEquip: Equipment): void {
+    setEquipment(newEquip);
+    saveData(tasks, newEquip, note, sessionLog);
+  }
+
+  function updateNote(val: string): void {
+    setNote(val);
+    saveData(tasks, equipment, val, sessionLog);
+  }
+
+  function toggleTask(id: number): void {
+    var task = tasks.find(function(t: Task) { return t.id === id; });
+    if (!task) return;
+    var newTasks = tasks.map(function(t: Task) {
+      return t.id === id ? { id: t.id, text: t.text, completed: !t.completed, critical: t.critical, category: t.category } : t;
+    });
+    var entry: LogEntry = {
+      time:   new Date().toLocaleTimeString("th-TH"),
+      action: task.completed ? "ยกเลิก" : "เสร็จสิ้น",
+      text:   task.text.substring(0, 30) + (task.text.length > 30 ? "..." : ""),
+    };
+    var log: LogEntry[] = sessionLog.concat([entry]).slice(-20);
+    setSessionLog(log);
+    setTasks(newTasks);
+    saveData(newTasks, equipment, note, log);
+  }
+
+  function addCustomTask(): void {
+    if (!newTask.trim()) return;
+    var newItem: Task = { id: Date.now(), text: newTask.trim(), completed: false, critical: false, category: "structure" };
+    var newTasks: Task[] = tasks.concat([newItem]);
+    setNewTask("");
+    setAddingTask(false);
+    updateTasks(newTasks);
+  }
+
+  function removeTask(id: number): void {
+    updateTasks(tasks.filter(function(t: Task) { return t.id !== id; }));
+  }
+
+  function resetAll(): void {
+    storageDelete(STORAGE_KEY);
+    setTasks(DEFAULT_TASKS);
+    setEquipment({ camera: "", lens: "", fps: 24, duration: 4.0 });
+    setNote("");
+    setSessionLog([]);
+    setShowReset(false);
+    setSaveStatus("idle");
+  }
+
+  function applyPreset(preset: Preset): void {
+    updateEquipment({ camera: equipment.camera, lens: equipment.lens, fps: preset.fps, duration: preset.duration });
+  }
+
+  // ─── Derived ─────────────────────────────────────────────────────────────
+
+  var totalFrames  = Math.ceil((Number(equipment.fps) || 0) * (Number(equipment.duration) || 0));
+  var completedCount = tasks.filter(function(t: Task) { return t.completed; }).length;
+  var criticalLeft   = tasks.filter(function(t: Task) { return t.critical && !t.completed; }).length;
+  var progress       = tasks.length > 0 ? Math.round((completedCount / tasks.length) * 100) : 0;
+  var isReady        = criticalLeft === 0;
+  var circumference  = 2 * Math.PI * 40;
+  var dashOffset     = circumference - (progress / 100) * circumference;
+
+  // ─── Loading ─────────────────────────────────────────────────────────────
+
+  if (loading) {
+    return (
+      <div style={{ minHeight: "100vh", background: "#08090d", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
+        <div style={{ textAlign: "center" }}>
+          <div style={{ width: 40, height: 40, border: "3px solid #1e2330", borderTop: "3px solid #ff5f00", borderRadius: "50%", animation: "spin 0.8s linear infinite", margin: "0 auto 12px" }} />
+          <p style={{ color: "#4a5568", fontSize: 11, letterSpacing: "0.2em", textTransform: "uppercase", margin: 0 }}>Loading BOLT...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Render ───────────────────────────────────────────────────────────────
+
+  var statusColor = isReady ? "#ff5f00" : progress > 60 ? "#facc15" : "#3b82f6";
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#08090d", color: "#e2e8f0", fontFamily: "-apple-system, BlinkMacSystemFont, sans-serif", paddingBottom: 100 }}>
+      <style>{`
+        @keyframes spin   { to { transform: rotate(360deg) } }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(6px) } to { opacity: 1; transform: translateY(0) } }
+        @keyframes pulse  { 0%,100%{opacity:1} 50%{opacity:0.4} }
+        .row  { cursor: pointer; transition: transform 0.15s; }
+        .row:active { transform: scale(0.985); }
+        .card { cursor: pointer; transition: opacity 0.15s; }
+        .card:active { opacity: 0.7; }
+        input:focus, textarea:focus { outline: none; }
+        ::-webkit-scrollbar { width: 4px; }
+        ::-webkit-scrollbar-thumb { background: #1e2330; border-radius: 2px; }
+      `}</style>
+
+      {/* Header */}
+      <header style={{ position: "sticky", top: 0, zIndex: 50, background: "rgba(8,9,13,0.96)", borderBottom: "1px solid rgba(255,255,255,0.06)", padding: "12px 16px" }}>
+        <div style={{ maxWidth: 520, margin: "0 auto", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ background: "#000", border: "2px solid #facc15", borderRadius: 6, padding: "3px 8px", boxShadow: "0 0 10px rgba(250,204,21,0.3)" }}>
+              <span style={{ color: "#facc15", fontWeight: 900, fontStyle: "italic", fontSize: 13, letterSpacing: "-0.04em", fontFamily: "monospace" }}>BOLT</span>
+            </div>
+            <div>
+              <div style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.15em", color: "#fff", textTransform: "uppercase" }}>by FBL</div>
+              <div style={{ fontSize: 9, color: "#4a5568" }}>FoongBinLek Film Service</div>
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            {saveStatus === "saving" && <span style={{ fontSize: 9, color: "#facc15", animation: "pulse 1s infinite" }}>SAVING...</span>}
+            {saveStatus === "saved"  && <span style={{ fontSize: 9, color: "#34d399" }}>✓ SAVED</span>}
+            {saveStatus === "error"  && <span style={{ fontSize: 9, color: "#f87171" }}>ERROR</span>}
+            <button onClick={function() { setShowReset(true); }}
+              style={{ background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.25)", borderRadius: 20, padding: "6px 14px", color: "#f87171", fontSize: 9, fontWeight: 800, letterSpacing: "0.15em", textTransform: "uppercase", cursor: "pointer" }}>
+              Reset
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <main style={{ maxWidth: 520, margin: "0 auto", padding: "16px 14px" }}>
+
+        {/* Status Hero */}
+        <section style={{ background: "#0d1117", borderRadius: 24, padding: "22px 20px", border: "1px solid rgba(255,255,255,0.06)", marginBottom: 14, animation: "fadeIn 0.3s ease" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 18 }}>
+            {/* Ring */}
+            <div style={{ position: "relative", flexShrink: 0 }}>
+              <svg width={92} height={92} style={{ transform: "rotate(-90deg)" }}>
+                <circle cx={46} cy={46} r={38} fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth={6} />
+                <circle cx={46} cy={46} r={38} fill="none"
+                  stroke={statusColor} strokeWidth={6}
+                  strokeDasharray={String(circumference)}
+                  strokeDashoffset={String(dashOffset)}
+                  strokeLinecap="round"
+                  style={{ transition: "stroke-dashoffset 0.6s ease, stroke 0.4s ease" }}
+                />
+              </svg>
+              <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+                <span style={{ fontSize: 20, fontWeight: 900, color: "#fff", lineHeight: 1 }}>{progress}%</span>
+                <span style={{ fontSize: 7, color: "#4a5568", letterSpacing: "0.12em", marginTop: 3 }}>READY</span>
+              </div>
+            </div>
+            {/* Info */}
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ fontSize: 17, fontWeight: 900, color: isReady ? "#ff5f00" : "#fff", marginBottom: 3, lineHeight: 1.2 }}>
+                {isReady ? "OPERATIONAL" : criticalLeft > 0 ? criticalLeft + " CRITICAL LEFT" : "ALMOST READY"}
+              </div>
+              <div style={{ fontSize: 11, color: "#4a5568", marginBottom: 10 }}>
+                {completedCount}/{tasks.length} tasks complete
+              </div>
+              <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+                {CATEGORIES.map(function(cat: CategoryMeta) {
+                  var catTasks = tasks.filter(function(t: Task) { return t.category === cat.key; });
+                  var catDone  = catTasks.filter(function(t: Task) { return t.completed; }).length;
+                  return (
+                    <div key={cat.key} style={{ display: "flex", alignItems: "center", gap: 4, background: "rgba(255,255,255,0.04)", borderRadius: 20, padding: "3px 8px" }}>
+                      <div style={{ width: 6, height: 6, borderRadius: "50%", background: catDone === catTasks.length && catTasks.length > 0 ? cat.color : "#1e2330" }} />
+                      <span style={{ fontSize: 9, color: "#4a5568", fontWeight: 700 }}>{cat.label}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Tabs */}
+        <div style={{ display: "flex", gap: 3, background: "#0d1117", borderRadius: 13, padding: 4, marginBottom: 14, border: "1px solid rgba(255,255,255,0.06)" }}>
+          {TABS.map(function(t) {
+            return (
+              <button key={t.id} onClick={function() { setTab(t.id); }}
+                style={{ flex: 1, padding: "8px 4px", borderRadius: 9, border: "none", cursor: "pointer", fontSize: 10, fontWeight: 800, letterSpacing: "0.08em", textTransform: "uppercase",
+                  background: tab === t.id ? "#ff5f00" : "transparent",
+                  color:      tab === t.id ? "#fff"    : "#4a5568",
+                }}>
+                {t.label}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* ══ CHECKLIST ══ */}
+        {tab === "checklist" && (
+          <div style={{ animation: "fadeIn 0.2s ease" }}>
+            {CATEGORIES.map(function(cat: CategoryMeta) {
+              var catTasks = tasks.filter(function(t: Task) { return t.category === cat.key; });
+              if (catTasks.length === 0) return null;
+              return (
+                <div key={cat.key} style={{ marginBottom: 14 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 7, paddingLeft: 2 }}>
+                    <div style={{ width: 3, height: 11, borderRadius: 2, background: cat.color }} />
+                    <span style={{ fontSize: 9, fontWeight: 800, color: "#4a5568", letterSpacing: "0.2em", textTransform: "uppercase" }}>{cat.label}</span>
+                  </div>
+                  {catTasks.map(function(task: Task) {
+                    return (
+                      <div key={task.id} className="row" onClick={function() { toggleTask(task.id); }}
+                        style={{ display: "flex", alignItems: "center", gap: 12, padding: "13px 15px", borderRadius: 13, marginBottom: 5, border: "1px solid",
+                          borderColor: task.completed ? "rgba(52,211,153,0.15)" : task.critical ? "rgba(255,255,255,0.07)" : "rgba(255,255,255,0.04)",
+                          background:  task.completed ? "rgba(52,211,153,0.05)" : "#0d1117",
+                        }}>
+                        {/* Checkbox */}
+                        <div style={{ width: 24, height: 24, borderRadius: 7, border: "2px solid " + (task.completed ? "#34d399" : task.critical ? "#ff5f00" : "#1e2330"),
+                          background: task.completed ? "#34d399" : "transparent",
+                          display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                          {task.completed && <span style={{ color: "#000", fontSize: 12, fontWeight: 900, lineHeight: 1 }}>✓</span>}
+                        </div>
+                        {/* Text */}
+                        <p style={{ flex: 1, fontSize: 13, fontWeight: 600, margin: 0, lineHeight: 1.4,
+                          color: task.completed ? "#374151" : "#e2e8f0",
+                          textDecoration: task.completed ? "line-through" : "none" }}>
+                          {task.text}
+                        </p>
+                        {task.critical && !task.completed && (
+                          <span style={{ fontSize: 8, fontWeight: 900, color: "#ff5f00", letterSpacing: "0.1em", flexShrink: 0 }}>CRIT</span>
+                        )}
+                        {task.id > 10 && (
+                          <button onClick={function(e) { e.stopPropagation(); removeTask(task.id); }}
+                            style={{ background: "none", border: "none", color: "#374151", cursor: "pointer", fontSize: 16, padding: "0 0 0 6px", lineHeight: 1, flexShrink: 0 }}>×</button>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              );
+            })}
+
+            {/* Custom tasks (id > 10, not matched above already shown inline) */}
+
+            {/* Add task input */}
+            {addingTask ? (
+              <div style={{ background: "#0d1117", borderRadius: 13, padding: 14, border: "1px solid rgba(255,95,0,0.35)", marginBottom: 8 }}>
+                <input value={newTask} onChange={function(e) { setNewTask(e.target.value); }}
+                  onKeyDown={function(e) { if (e.key === "Enter") addCustomTask(); }}
+                  placeholder="Task ใหม่..." autoFocus
+                  style={{ width: "100%", background: "transparent", border: "none", color: "#e2e8f0", fontSize: 13, fontWeight: 600, marginBottom: 10, boxSizing: "border-box" }} />
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={addCustomTask}
+                    style={{ flex: 1, background: "#ff5f00", border: "none", borderRadius: 8, padding: "8px", color: "#fff", fontSize: 10, fontWeight: 800, cursor: "pointer" }}>ADD</button>
+                  <button onClick={function() { setAddingTask(false); setNewTask(""); }}
+                    style={{ flex: 1, background: "#1a2030", border: "none", borderRadius: 8, padding: "8px", color: "#4a5568", fontSize: 10, fontWeight: 800, cursor: "pointer" }}>CANCEL</button>
+                </div>
+              </div>
+            ) : (
+              <button onClick={function() { setAddingTask(true); }}
+                style={{ width: "100%", background: "transparent", border: "1px dashed rgba(255,255,255,0.1)", borderRadius: 13, padding: "11px", color: "#4a5568", fontSize: 10, fontWeight: 800, letterSpacing: "0.15em", cursor: "pointer" }}>
+                + ADD CUSTOM TASK
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* ══ FRAMES ══ */}
+        {tab === "calc" && (
+          <div style={{ animation: "fadeIn 0.2s ease" }}>
+            {/* Presets */}
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontSize: 9, color: "#4a5568", fontWeight: 800, letterSpacing: "0.2em", textTransform: "uppercase", marginBottom: 8 }}>Quick Presets</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                {MOVE_PRESETS.map(function(p: Preset) {
+                  return (
+                    <div key={p.name} className="card" onClick={function() { applyPreset(p); }}
+                      style={{ background: "#0d1117", borderRadius: 12, padding: "12px 14px", border: "1px solid rgba(255,255,255,0.06)" }}>
+                      <div style={{ fontSize: 13, fontWeight: 800, color: "#e2e8f0", marginBottom: 2 }}>{p.name}</div>
+                      <div style={{ fontSize: 9, color: "#4a5568", marginBottom: 6 }}>{p.desc}</div>
+                      <div style={{ fontSize: 10, color: "#ff5f00", fontWeight: 700 }}>{p.fps}fps · {p.duration}s</div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Inputs */}
+            <div style={{ background: "#0d1117", borderRadius: 16, padding: "18px 16px", border: "1px solid rgba(255,255,255,0.06)", marginBottom: 12 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
+                <div>
+                  <div style={{ fontSize: 9, color: "#4a5568", fontWeight: 800, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>FPS</div>
+                  <input type="number" value={equipment.fps}
+                    onChange={function(e) { updateEquipment({ camera: equipment.camera, lens: equipment.lens, fps: Number(e.target.value), duration: equipment.duration }); }}
+                    style={{ width: "100%", background: "#000", border: "2px solid #1a2030", borderRadius: 10, padding: "11px", fontSize: 22, fontWeight: 900, color: "#fff", textAlign: "center", boxSizing: "border-box" }} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 9, color: "#4a5568", fontWeight: 800, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>Duration (s)</div>
+                  <input type="number" step="0.1" value={equipment.duration}
+                    onChange={function(e) { updateEquipment({ camera: equipment.camera, lens: equipment.lens, fps: equipment.fps, duration: Number(e.target.value) }); }}
+                    style={{ width: "100%", background: "#000", border: "2px solid #1a2030", borderRadius: 10, padding: "11px", fontSize: 22, fontWeight: 900, color: "#fff", textAlign: "center", boxSizing: "border-box" }} />
+                </div>
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                <span style={{ fontSize: 9, color: "#4a5568" }}>0.5s</span>
+                <span style={{ fontSize: 9, color: "#4a5568" }}>30s</span>
+              </div>
+              <input type="range" min="0.5" max="30" step="0.5" value={equipment.duration}
+                onChange={function(e) { updateEquipment({ camera: equipment.camera, lens: equipment.lens, fps: equipment.fps, duration: parseFloat(e.target.value) }); }}
+                style={{ width: "100%", accentColor: "#ff5f00" }} />
+            </div>
+
+            {/* Result */}
+            <div style={{ background: "#000", borderRadius: 20, padding: "30px 20px", border: "3px solid #3b82f6", textAlign: "center", boxSizing: "border-box" }}>
+              <div style={{ fontSize: 10, color: "#3b82f6", fontWeight: 800, letterSpacing: "0.25em", textTransform: "uppercase", marginBottom: 8 }}>Total Frames</div>
+              <div style={{ fontSize: 68, fontWeight: 900, color: "#fff", lineHeight: 0.9, letterSpacing: "-0.04em" }}>{totalFrames.toLocaleString()}</div>
+              <div style={{ fontSize: 10, color: "#1e2330", fontWeight: 700, marginTop: 14, letterSpacing: "0.2em" }}>→ SET IN FLAIR WINDOW</div>
+              <div style={{ marginTop: 10, padding: "7px 14px", background: "rgba(59,130,246,0.1)", borderRadius: 8, display: "inline-block" }}>
+                <span style={{ fontSize: 10, color: "#60a5fa" }}>{equipment.fps} fps × {equipment.duration}s = {totalFrames} frames</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ══ GEAR ══ */}
+        {tab === "gear" && (
+          <div style={{ animation: "fadeIn 0.2s ease" }}>
+            <div style={{ background: "#0d1117", borderRadius: 16, padding: "16px", border: "1px solid rgba(255,255,255,0.06)", marginBottom: 12 }}>
+              <div style={{ fontSize: 9, color: "#4a5568", fontWeight: 800, letterSpacing: "0.2em", marginBottom: 12 }}>HARDWARE CONFIGURATION</div>
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ fontSize: 9, color: "#4a5568", marginBottom: 6 }}>CAMERA BODY</div>
+                <input value={equipment.camera}
+                  onChange={function(e) { updateEquipment({ camera: e.target.value, lens: equipment.lens, fps: equipment.fps, duration: equipment.duration }); }}
+                  placeholder="เช่น ARRI ALEXA 35..."
+                  style={{ width: "100%", background: "#000", border: "2px solid #1a2030", borderRadius: 10, padding: "11px 14px", fontSize: 14, fontWeight: 700, color: "#fff", boxSizing: "border-box" }} />
+              </div>
+              <div>
+                <div style={{ fontSize: 9, color: "#4a5568", marginBottom: 6 }}>LENS</div>
+                <input value={equipment.lens}
+                  onChange={function(e) { updateEquipment({ camera: equipment.camera, lens: e.target.value, fps: equipment.fps, duration: equipment.duration }); }}
+                  placeholder="เช่น ZEISS Master Prime 35mm T1.3..."
+                  style={{ width: "100%", background: "#000", border: "2px solid #1a2030", borderRadius: 10, padding: "11px 14px", fontSize: 14, fontWeight: 700, color: "#fff", boxSizing: "border-box" }} />
+              </div>
+            </div>
+
+            <div style={{ background: "#0d1117", borderRadius: 16, padding: "16px", border: "1px solid rgba(255,255,255,0.06)", marginBottom: 12 }}>
+              <div style={{ fontSize: 9, color: "#4a5568", fontWeight: 800, letterSpacing: "0.2em", marginBottom: 10 }}>SESSION NOTES</div>
+              <textarea value={note} onChange={function(e) { updateNote(e.target.value); }}
+                placeholder="บันทึกข้อมูล Set, Issues, หรือ Notes สำคัญ..."
+                rows={6}
+                style={{ width: "100%", background: "#000", border: "2px solid #1a2030", borderRadius: 10, padding: "11px 14px", fontSize: 13, color: "#e2e8f0", resize: "vertical", boxSizing: "border-box", lineHeight: 1.6 }} />
+            </div>
+
+            {(equipment.camera || equipment.lens) && (
+              <div style={{ background: "#0d1117", borderRadius: 16, padding: "16px", border: "1px solid rgba(255,95,0,0.2)" }}>
+                <div style={{ fontSize: 9, color: "#ff5f00", fontWeight: 800, letterSpacing: "0.2em", marginBottom: 10 }}>SHOOT SUMMARY</div>
+                {equipment.camera && <div style={{ fontSize: 13, color: "#e2e8f0", marginBottom: 4 }}>📷 {equipment.camera}</div>}
+                {equipment.lens   && <div style={{ fontSize: 13, color: "#e2e8f0", marginBottom: 4 }}>🔭 {equipment.lens}</div>}
+                <div style={{ fontSize: 13, color: "#e2e8f0" }}>
+                  🎬 {equipment.fps}fps × {equipment.duration}s = <strong style={{ color: "#ff5f00" }}>{totalFrames.toLocaleString()} frames</strong>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ══ LOG ══ */}
+        {tab === "log" && (
+          <div style={{ animation: "fadeIn 0.2s ease" }}>
+            <div style={{ background: "#0d1117", borderRadius: 16, border: "1px solid rgba(255,255,255,0.06)", overflow: "hidden" }}>
+              <div style={{ padding: "13px 16px", borderBottom: "1px solid rgba(255,255,255,0.06)", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontSize: 9, color: "#4a5568", fontWeight: 800, letterSpacing: "0.2em" }}>SESSION ACTIVITY LOG</span>
+                <span style={{ fontSize: 9, color: "#374151" }}>{sessionLog.length} events</span>
+              </div>
+              {sessionLog.length === 0 ? (
+                <div style={{ padding: "32px 16px", textAlign: "center", color: "#374151", fontSize: 12 }}>
+                  No activity yet — start checking tasks!
+                </div>
+              ) : (
+                sessionLog.slice().reverse().map(function(entry: LogEntry, i: number) {
+                  return (
+                    <div key={i} style={{ padding: "10px 16px", borderBottom: "1px solid rgba(255,255,255,0.03)", display: "flex", gap: 10, alignItems: "flex-start" }}>
+                      <span style={{ fontSize: 9, color: "#4a5568", flexShrink: 0, marginTop: 2, minWidth: 55 }}>{entry.time}</span>
+                      <span style={{ fontSize: 11, fontWeight: 700, flexShrink: 0, color: entry.action === "เสร็จสิ้น" ? "#34d399" : "#f87171" }}>{entry.action}</span>
+                      <span style={{ fontSize: 11, color: "#4a5568", lineHeight: 1.4 }}>{entry.text}</span>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
+
+      </main>
+
+      {/* Bottom Bar */}
+      <div style={{ position: "fixed", bottom: 16, left: "50%", transform: "translateX(-50%)", width: "calc(100% - 28px)", maxWidth: 490, zIndex: 100 }}>
+        <div style={{ borderRadius: 50, padding: "13px 20px", display: "flex", justifyContent: "space-between", alignItems: "center", border: "1px solid",
+          background:  isReady ? "#ff5f00" : "rgba(13,17,23,0.97)",
+          borderColor: isReady ? "rgba(255,255,255,0.2)" : "rgba(255,255,255,0.06)" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 14 }}>{isReady ? "🟢" : "🔴"}</span>
+            <span style={{ fontSize: 9, fontWeight: 900, letterSpacing: "0.15em", textTransform: "uppercase", color: isReady ? "#fff" : "#4a5568" }}>
+              {isReady ? "OPERATIONAL READY" : "LOCKED · " + criticalLeft + " CRITICAL"}
+            </span>
+          </div>
+          <span style={{ fontSize: 22, fontWeight: 900, fontStyle: "italic", color: isReady ? "#fff" : "#1e2330" }}>{progress}%</span>
+        </div>
+      </div>
+
+      {/* Reset Modal */}
+      {showReset && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.82)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+          <div style={{ background: "#0d1117", borderRadius: 20, padding: 24, border: "1px solid rgba(239,68,68,0.3)", maxWidth: 300, width: "100%" }}>
+            <div style={{ fontSize: 15, fontWeight: 800, color: "#f87171", marginBottom: 8 }}>Reset ทุกอย่าง?</div>
+            <div style={{ fontSize: 13, color: "#4a5568", marginBottom: 20, lineHeight: 1.6 }}>
+              ข้อมูลทั้งหมดจะถูกลบออก รวมถึง Checklist, Gear และ Notes
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={resetAll}
+                style={{ flex: 1, background: "#f87171", border: "none", borderRadius: 10, padding: "11px", color: "#fff", fontSize: 11, fontWeight: 800, cursor: "pointer", letterSpacing: "0.1em" }}>RESET</button>
+              <button onClick={function() { setShowReset(false); }}
+                style={{ flex: 1, background: "#1a2030", border: "none", borderRadius: 10, padding: "11px", color: "#4a5568", fontSize: 11, fontWeight: 800, cursor: "pointer", letterSpacing: "0.1em" }}>CANCEL</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
