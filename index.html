@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DCA Strategy Tracker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <style>
+        body { background-color: #0f172a; color: #e2e8f0; font-family: 'Sarabun', sans-serif; }
+        .card { background: #1e293b; border-radius: 1rem; padding: 1.5rem; margin-bottom: 1rem; border: 1px solid #334155; }
+    </style>
+</head>
+<body class="p-4">
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-3xl font-bold text-[#00f2fe] mb-6">Investment Strategy Dashboard</h1>
+        
+        <div class="card">
+            <h3 class="text-xl mb-4">Monte Carlo Simulation</h3>
+            <div id="plotlyMonteCarlo" style="width:100%; height:400px;"></div>
+        </div>
+    </div>
+
+    <script>
+        // พดด้วงย้ายมาไว้ข้างล่างเพื่อให้รันหลังจาก HTML พร้อมแล้ว
+        window.onload = function() {
+            const x = [], y = [];
+            for (let i = 0; i < 300; i++) {
+                x.push(Math.random() * 100);
+                y.push(150 + (Math.random() - 0.5) * 50);
+            }
+
+            const trace = {
+                x: x, y: y, mode: 'markers', type: 'scattergl',
+                marker: { color: '#00f2fe', size: 6, opacity: 0.6 }
+            };
+
+            const layout = {
+                paper_bgcolor: 'rgba(0,0,0,0)',
+                plot_bgcolor: 'rgba(0,0,0,0)',
+                font: { color: '#64748b' }
+            };
+
+            // ตรวจสอบว่า ID มีอยู่จริงก่อนรัน
+            if (document.getElementById('plotlyMonteCarlo')) {
+                Plotly.newPlot('plotlyMonteCarlo', [trace], layout, {displayModeBar: false});
+            }
+        };
+    </script>
+</body>
+</html>
